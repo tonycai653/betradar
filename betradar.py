@@ -19,8 +19,11 @@ COMPETITION_STATUS_DELAY = 60
 COMPETITION_STATUS_AP = 120
 
 EVENT_TYPID_ALREADY_START = 10
+EVENT_TYPID_ABOUT_TO_START = 1024
 
 SOCCER_SID = 1
+ONGOING_MATCH_IDS = []
+lock_matchid = threading.RLock()
 
 
 headers = {
@@ -155,10 +158,8 @@ def live_events(d):
                   'minutes', 'periodname', 'result', 'situation',
                   'team', 'time', 'name']:
             if k in event:
-                if k == '_typeid':
-                    LOGGER.debug(isinstance(event[k], str))
-                #l.append((k, int(event[k]) if isinstance(event[k], str) and
-                #          event[k].isdigit() else event[k]))
+                l.append((k, int(event[k]) if isinstance(event[k], unicode) and
+                          event[k].isdigit() else event[k]))
         da.append(dict(l))
     dic['events'] = da
 
@@ -168,7 +169,10 @@ def live_events(d):
 def send_timelinedelta_for(id):
     p = threading.Thread(target=timelinedelta, args=(id, ))
     p.start()
-    LOGGER.debug('开启了一个线程处理id: %s' % id)
+    lock_matchid.acquire()
+    ONGOING_MATCH_IDS.append(id)
+    lock_matchid.release()
+    LOGGER.warning('开启了一个线程处理id: %s' % id)
 
     return p
 
@@ -190,12 +194,20 @@ def timelinedelta(id):
             da = get_data(data('https://ls.sportradar.com/ls/feeds/?/betradar/zh/Europe:Berlin/gismo/match_timelinedelta/%s' % id))
 
             if da['match']['status']['_id'] == COMPETITION_STATUS_END:
-                LOGGER.debug('比赛: %s已结束，线程将退出' %d)
+                lock_matchid.acquire()
+                LOGGER.warning('比赛: %s已结束，线程将退出' % id)
+                ONGOING_MATCH_IDS.remove(id)
+                lock_matchid.release()
                 break
+            if da['match']['status']['_id'] == COMPETITION_STATUS_CANCEL:
+                lock_matchid.acquire()
+                LOGGER.warning('比赛: %s被取消, 线程将退出' % id)
+                ONGOING_MATCH_IDS.remove(id)
+                lock_matchid.release()
             d = transfor(da)
-            if d is not None:
-                LOGGER.debug(json.dumps(d, indent=1, ensure_ascii=False, encoding='utf-8'))
-                oneMq.send_msg('betradar', json.dumps(d))
+            #if d is not None:
+            #    LOGGER.debug(json.dumps(d, indent=1, ensure_ascii=False, encoding='utf-8'))
+            #    oneMq.send_msg('betradar', json.dumps(d))
             time.sleep(2)
 
 
@@ -206,11 +218,17 @@ def get_soccer_events():
 
 def new_match_start():
     while True:
-        LOGGER.debug('finding recently new started matches')
+        LOGGER.warning('准备检查有没有新开始的比赛......')
         for soccer_ev in get_soccer_events():
-            if soccer_ev['_typeid'] == EVENT_TYPID_ALREADY_START:
-                send_timelinedelta_for(soccer_ev['matchid'])
+            if soccer_ev['_typeid'] == EVENT_TYPID_ALREADY_START or soccer_ev['_typeid'] == EVENT_TYPID_ABOUT_TO_START:
+                LOGGER.warning('比赛: %s 已经开始' % soccer_ev['matchid'])
+                lock_matchid.acquire()
+                if soccer_ev['matchid'] not in ONGOING_MATCH_IDS:
+                    ONGOING_MATCH_IDS.append(soccer_ev['matchid'])
+                    send_timelinedelta_for(soccer_ev['matchid'])
+                lock_matchid.release()
         time.sleep(30)
+
 
 def update_soccer_events():
 
@@ -231,6 +249,9 @@ def initialize():
     p1.daemon = True
     p1.start()
 
+    p2 = threading.Thread(target=new_match_start)
+    p2.start()
+
 
 if __name__  == '__main__':
     config.fileConfig('logger.conf', disable_existing_loggers=False)
@@ -241,7 +262,15 @@ if __name__  == '__main__':
         for ongoing_match_id in ids:
             send_timelinedelta_for(ongoing_match_id)
         if not ids:
-            LOGGER.info('现在没有比赛.....')
-            time.sleep(5)
+            LOGGER.warning('现在没有比赛.....')
+            LOGGER.warning('30秒后重新检查')
+            time.sleep(30)
         else:
             break
+    while True:
+        LOGGER.warning('=' * 50)
+        lock_matchid.acquire()
+        LOGGER.warning('现在正在进行的比赛有: %s' % ONGOING_MATCH_IDS)
+        lock_matchid.release()
+        LOGGER.warning('=' * 50)
+        time.sleep(30)
