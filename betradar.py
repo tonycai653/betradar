@@ -7,7 +7,6 @@ import time
 from logging import config
 import logging
 import sys
-import datetime
 
 timeline_base_url = 'https://ls.sportradar.com/ls/feeds/?/betradar/en/Europe:Berlin/gismo/match_timelinedelta/'
 LOGGER = logging.getLogger(__name__)
@@ -29,16 +28,6 @@ lock_matchid = threading.RLock()
 headers = {
     'Accept-Language': 'zh-CN;q=0.6',
 }
-
-SOCCER_EVENTS = None
-lock_events = threading.RLock()
-
-
-def tomorrow():
-    tod = datetime.datetime.today()
-    tod = tod.replace(hour=0).replace(minute=0).replace(second=0).replace(microsecond=0)
-    tomo = tod + datetime.timedelta(days=1)
-    return tomo
 
 
 def data(url, headers=headers):
@@ -71,9 +60,7 @@ def get_data(events):
 
 def soccer_tournaments():
 
-    lock_events.acquire()
     soccer = get_data(soccer_events())[0]
-    lock_events.release()
     assert soccer['_doc'] == 'sport'
     assert soccer['name'] == 'Soccer'
     assert soccer['_id'] == 1
@@ -103,14 +90,7 @@ def soccer_ids():
 
 
 def soccer_events():
-    global SOCCER_EVENTS
-    if SOCCER_EVENTS is None:
-        SOCCER_EVENTS = get_events()
-    return SOCCER_EVENTS
-
-
-def istomorrow():
-    return True if datetime.datetime.now() - tomorrow() > 0 else False
+    return get_events()
 
 
 def ongoing_match_ids():
@@ -167,14 +147,13 @@ def live_events(d):
 
 
 def send_timelinedelta_for(id):
-    p = threading.Thread(target=timelinedelta, args=(id, ))
-    p.start()
     lock_matchid.acquire()
-    ONGOING_MATCH_IDS.append(id)
+    if id not in ONGOING_MATCH_IDS:
+        ONGOING_MATCH_IDS.append(id)
+        p = threading.Thread(target=timelinedelta, args=(id, ))
+        p.start()
+        LOGGER.warning('开启了一个线程处理id: %s' % id)
     lock_matchid.release()
-    LOGGER.warning('开启了一个线程处理id: %s' % id)
-
-    return p
 
 
 def transfor(d):
@@ -205,49 +184,29 @@ def timelinedelta(id):
                 ONGOING_MATCH_IDS.remove(id)
                 lock_matchid.release()
             d = transfor(da)
-            #if d is not None:
-            #    LOGGER.debug(json.dumps(d, indent=1, ensure_ascii=False, encoding='utf-8'))
-            #    oneMq.send_msg('betradar', json.dumps(d))
+            if d is not None:
+                LOGGER.warning(json.dumps(d, indent=1, ensure_ascii=False, encoding='utf-8'))
+                oneMq.send_msg('betradar', json.dumps(d))
             time.sleep(2)
 
 
 def get_soccer_events():
     url = 'https://ls.sportradar.com/ls/feeds/?/betradar/zh/Europe:Berlin/gismo/event_get'
-    return [ev for ev in get_data(data(url)) if ev['_sid'] == SOCCER_SID]
+    return [ev for ev in get_data(data(url)) if int(ev['_sid']) == SOCCER_SID]
 
 
 def new_match_start():
     while True:
         LOGGER.warning('准备检查有没有新开始的比赛......')
-        for soccer_ev in get_soccer_events():
-            if soccer_ev['_typeid'] == EVENT_TYPID_ALREADY_START or soccer_ev['_typeid'] == EVENT_TYPID_ABOUT_TO_START:
+        ets = get_soccer_events()
+        for soccer_ev in ets:
+            if int(soccer_ev['_typeid']) == EVENT_TYPID_ALREADY_START or int(soccer_ev['_typeid']) == EVENT_TYPID_ABOUT_TO_START:
                 LOGGER.warning('比赛: %s 已经开始' % soccer_ev['matchid'])
-                lock_matchid.acquire()
-                if soccer_ev['matchid'] not in ONGOING_MATCH_IDS:
-                    ONGOING_MATCH_IDS.append(soccer_ev['matchid'])
-                    send_timelinedelta_for(soccer_ev['matchid'])
-                lock_matchid.release()
-        time.sleep(30)
-
-
-def update_soccer_events():
-
-    global SOCCER_EVENTS
-    while True:
-        lock_events.acquire()
-        LOGGER.debug('得到lock_events锁')
-        SOCCER_EVENTS = get_events()
-        lock_events.release()
-        LOGGER.debug('释放了lock_events锁')
-        t = (tomorrow() - datetime.datetime.now()).total_seconds() + 5
-        time.sleep(t)
+                send_timelinedelta_for(int(soccer_ev['matchid']))
+        time.sleep(10)
 
 
 def initialize():
-
-    p1 = threading.Thread(target=update_soccer_events)
-    p1.daemon = True
-    p1.start()
 
     p2 = threading.Thread(target=new_match_start)
     p2.start()
